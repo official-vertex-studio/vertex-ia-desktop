@@ -244,7 +244,7 @@ async fn ollama_chat(app: AppHandle, base_url: String, model: String, messages: 
                     let _ = app.emit("ollama-chat-token", content.to_string());
                 }
                 if value.get("done").and_then(|v| v.as_bool()) == Some(true) {
-                    let _ = app.emit("ollama-chat-done", value);
+                    let _ = app.emit("ollama-chat-done", &value);
                 }
                 if let Some(error) = value.get("error").and_then(|v| v.as_str()) { return Err(error.to_string()); }
             }
