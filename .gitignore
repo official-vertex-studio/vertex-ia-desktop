@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.DS_Store
+.vscode/
+*.log
+src-tauri/target/
+src-tauri/gen/
+
+# Large official Ollama runtime archives are fetched during Windows packaging
+src-tauri/resources/*.zip
+src-tauri/resources/*.download

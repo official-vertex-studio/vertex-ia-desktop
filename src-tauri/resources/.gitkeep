@@ -1,0 +1,1 @@
+Runtime archives are downloaded by scripts/prepare-runtime.mjs before packaging.

@@ -1,0 +1,27 @@
+[package]
+name = "vertex-ai-desktop"
+version = "2.9.0"
+description = "VERTEX AI Desktop — standalone local AI workspace"
+authors = ["Vertex Studio"]
+edition = "2021"
+
+[lib]
+name = "vertex_ai_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["process", "time", "sync", "io-util"] }
+walkdir = "2"
+urlencoding = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sysinfo = "0.33"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+portable-pty = "0.9.0"
