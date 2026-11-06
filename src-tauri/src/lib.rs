@@ -2,7 +2,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
 use tauri::path::BaseDirectory;
 use std::{collections::HashMap, fs, io::{Read, Write}, net::TcpListener, path::{Path, PathBuf}, process::{Child, Command, Stdio}, sync::{Arc, Mutex, OnceLock}, thread, time::Duration};
-use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize, PtySystem, SlavePty};
+use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
 use walkdir::WalkDir;
 use rusqlite::{params, Connection};
 use sysinfo::System;
@@ -128,7 +128,7 @@ fn terminal_start(app: AppHandle, root: String) -> Result<u32, String> {
     let root_path = Path::new(&root).canonicalize().map_err(|e| format!("Dossier de terminal invalide: {e}"))?;
     if !root_path.is_dir() { return Err("Le dossier de travail n'est pas un dossier.".into()); }
     let pty_system = native_pty_system();
-    let mut pair = pty_system.openpty(PtySize { rows: 28, cols: 110, pixel_width: 0, pixel_height: 0 }).map_err(|e| format!("Impossible de créer le terminal système: {e}"))?;
+    let pair = pty_system.openpty(PtySize { rows: 28, cols: 110, pixel_width: 0, pixel_height: 0 }).map_err(|e| format!("Impossible de créer le terminal système: {e}"))?;
     #[cfg(windows)]
     let mut builder = CommandBuilder::new("powershell.exe");
     #[cfg(not(windows))]
@@ -230,6 +230,7 @@ async fn search_ollama_library(query: String, page: u32) -> Result<String, Strin
 
 #[tauri::command]
 async fn ollama_chat(app: AppHandle, base_url: String, model: String, messages: Vec<serde_json::Value>, options: Option<serde_json::Value>) -> Result<(), String> {
+    if base_url.trim_end_matches('/') == format!("http://{}", VERTEX_OLLAMA_HOST) { start_embedded_ollama(&app, false).await?; }
     let url = format!("{}/api/chat", base_url.trim_end_matches('/'));
     let mut body = serde_json::json!({"model": model, "messages": messages, "stream": true, "keep_alive": "5m"});
     if let Some(opts) = options { body["options"] = opts; }
@@ -257,6 +258,7 @@ async fn ollama_chat(app: AppHandle, base_url: String, model: String, messages: 
 
 #[tauri::command]
 async fn ollama_pull(app: AppHandle, base_url: String, model: String) -> Result<(), String> {
+    if base_url.trim_end_matches('/') == format!("http://{}", VERTEX_OLLAMA_HOST) { start_embedded_ollama(&app, false).await?; }
     let health_url = format!("{}/api/version", base_url.trim_end_matches('/'));
     reqwest::Client::new().get(&health_url).timeout(std::time::Duration::from_secs(5)).send().await
         .map_err(|e| format!("Vertex Local Engine inaccessible sur {base_url}. Démarre le moteur puis réessaie : {e}"))?
@@ -282,6 +284,7 @@ const VERTEX_OLLAMA_HOST: &str = "127.0.0.1:11435";
 const OLLAMA_WINDOWS_URL: &str = "https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64.zip";
 const OLLAMA_WINDOWS_ROCM_URL: &str = "https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64-rocm.zip";
 static OLLAMA_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
+static OLLAMA_START_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 static TERMINAL_PIDS: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
 fn child_slot() -> &'static Mutex<Option<Child>> { OLLAMA_CHILD.get_or_init(|| Mutex::new(None)) }
@@ -298,6 +301,25 @@ fn runtime_directory(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+fn runtime_log_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?.join("logs");
+    fs::create_dir_all(&dir).map_err(|e| format!("Création du dossier de journaux impossible: {e}"))?;
+    Ok(dir.join("ollama-runtime.log"))
+}
+
+fn append_runtime_log(app: &AppHandle, message: &str) {
+    if let Ok(path) = runtime_log_path(app) {
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "[{}] {}", chrono_free_timestamp(), message);
+        }
+    }
+}
+
+fn chrono_free_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs().to_string()).unwrap_or_else(|_| "unknown-time".into())
+}
+
 fn models_directory(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?.join("models");
     fs::create_dir_all(&dir).map_err(|e| format!("Création du dossier modèles impossible: {e}"))?;
@@ -305,7 +327,13 @@ fn models_directory(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn bundled_resource(app: &AppHandle, name: &str) -> Option<PathBuf> {
-    app.path().resolve(format!("resources/{name}"), BaseDirectory::Resource).ok()
+    let candidates = [
+        app.path().resolve(format!("resources/{name}"), BaseDirectory::Resource).ok(),
+        app.path().resolve(name, BaseDirectory::Resource).ok(),
+        app.path().resource_dir().ok().map(|dir| dir.join("resources").join(name)),
+        app.path().resource_dir().ok().map(|dir| dir.join(name)),
+    ];
+    candidates.into_iter().flatten().find(|path| path.is_file())
 }
 
 async fn download_runtime_archive(app: &AppHandle, url: &str, target: &Path, label: &str) -> Result<(), String> {
@@ -358,8 +386,16 @@ fn amd_gpu_present() -> bool {
 
 async fn provision_embedded_runtime(app: &AppHandle, force_download: bool) -> Result<PathBuf, String> {
     let runtime = runtime_directory(app)?;
-    if !force_download { if let Some(exe) = find_ollama_executable(&runtime) { return Ok(exe); } }
-    let _ = app.emit("vertex-runtime-progress", serde_json::json!({"phase":"prepare","label":"Préparation du moteur IA local"}));
+    if !force_download {
+        if let Some(exe) = find_ollama_executable(&runtime) {
+            let version = Command::new(&exe).arg("--version").output();
+            if version.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+                return Ok(exe);
+            }
+            append_runtime_log(app, &format!("Runtime existant invalide, réinstallation automatique : {}", exe.display()));
+        }
+    }
+    let _ = app.emit("vertex-runtime-progress", serde_json::json!({"phase":"prepare","label":"Préparation automatique du moteur IA local"}));
     if force_download { let _ = fs::remove_dir_all(&runtime); fs::create_dir_all(&runtime).map_err(|e| e.to_string())?; }
     let base_archive = runtime.join("ollama-windows-amd64.zip");
     let mut bundled = false;
@@ -406,7 +442,7 @@ async fn embedded_ollama_ready(timeout: Duration) -> bool {
     }
 }
 
-async fn start_embedded_ollama(app: &AppHandle, force_download: bool) -> Result<String, String> {
+async fn start_embedded_ollama_once(app: &AppHandle, force_download: bool) -> Result<String, String> {
     #[cfg(not(windows))] { let _ = app; let _ = force_download; return Err("Cette version All-in-One est actuellement prévue pour Windows x64.".into()); }
     #[cfg(windows)] {
         if force_download {
@@ -445,21 +481,56 @@ async fn start_embedded_ollama(app: &AppHandle, force_download: bool) -> Result<
         drop(listener);
 
         let models = models_directory(app)?;
+        let log_path = runtime_log_path(app)?;
+        let stdout = fs::OpenOptions::new().create(true).append(true).open(&log_path).map_err(|e| format!("Ouverture du journal Ollama impossible: {e}"))?;
+        let stderr = stdout.try_clone().map_err(|e| e.to_string())?;
+        append_runtime_log(app, &format!("Démarrage demandé. Exécutable={}, modèles={}, endpoint=http://{}", executable.display(), models.display(), VERTEX_OLLAMA_HOST));
         let mut command = Command::new(&executable);
-        command.arg("serve").env("OLLAMA_HOST", VERTEX_OLLAMA_HOST).env("OLLAMA_MODELS", models)
+        command.arg("serve").env("OLLAMA_HOST", VERTEX_OLLAMA_HOST).env("OLLAMA_MODELS", &models)
             .env("OLLAMA_KEEP_ALIVE", "5m").env("OLLAMA_ORIGINS", "tauri://localhost,http://tauri.localhost")
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            .env("OLLAMA_NO_CLOUD", "1")
+            .stdin(Stdio::null()).stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr));
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
-        let child = command.spawn().map_err(|e| format!("Impossible de démarrer le moteur Vertex Local ({}): {e}", executable.display()))?;
+        let child = command.spawn().map_err(|e| {
+            append_runtime_log(app, &format!("Échec du lancement du processus: {e}"));
+            format!("Impossible de démarrer le moteur Vertex Local ({}): {e}. Journal : {}", executable.display(), log_path.display())
+        })?;
         if let Ok(mut slot) = child_slot().lock() { *slot = Some(child); }
 
-        if !embedded_ollama_ready(Duration::from_secs(45)).await {
+        if !embedded_ollama_ready(Duration::from_secs(90)).await {
+            let process_state = child_slot().lock().ok().and_then(|mut slot| slot.as_mut().map(|child| child.try_wait().ok().flatten()));
             stop_embedded_ollama();
-            return Err("Ollama a été lancé, mais son API n'a pas répondu après 45 secondes. Vérifie l'espace disque et les droits du dossier LocalAppData, puis utilise Réparer le moteur.".into());
+            append_runtime_log(app, &format!("Délai dépassé : API non disponible. État processus={process_state:?}"));
+            return Err(format!("Ollama a été lancé, mais son API n'a pas répondu après 90 secondes. Consulte le journal : {}", log_path.display()));
         }
+        append_runtime_log(app, "API Ollama vérifiée : moteur opérationnel.");
         let _ = app.emit("vertex-runtime-progress", serde_json::json!({"phase":"started","label":"Vertex Local Engine démarré et vérifié"}));
         Ok("Vertex Local Engine est démarré et son API est prête. Les modèles peuvent être téléchargés.".into())
+    }
+}
+
+async fn start_embedded_ollama(app: &AppHandle, force_download: bool) -> Result<String, String> {
+    let _guard = ollama_start_lock().lock().await;
+    if !force_download && embedded_ollama_ready(Duration::from_secs(2)).await {
+        append_runtime_log(app, "Moteur déjà actif : réutilisation de l'API locale.");
+        return Ok("Vertex Local Engine est déjà actif et son API répond correctement.".into());
+    }
+    match start_embedded_ollama_once(app, force_download).await {
+        Ok(message) => Ok(message),
+        Err(first_error) if !force_download && !first_error.contains("port local 11435 est occupé") => {
+            append_runtime_log(app, &format!("Premier démarrage en échec : {first_error}. Tentative de réparation automatique."));
+            let _ = app.emit("vertex-runtime-progress", serde_json::json!({"phase":"repair","label":"Réparation automatique du moteur local…"}));
+            stop_embedded_ollama();
+            match start_embedded_ollama_once(app, true).await {
+                Ok(message) => Ok(format!("Moteur réparé automatiquement. {message}")),
+                Err(repair_error) => {
+                    append_runtime_log(app, &format!("Réparation automatique en échec : {repair_error}"));
+                    Err(format!("Démarrage impossible : {first_error}. Réparation automatique impossible : {repair_error}"))
+                }
+            }
+        }
+        Err(error) => { append_runtime_log(app, &format!("Démarrage impossible : {error}")); Err(error) }
     }
 }
 

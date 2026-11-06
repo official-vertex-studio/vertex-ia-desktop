@@ -75,6 +75,8 @@ export default function DesktopApp() {
   const bottomRef = useRef(null);
   const abortRef = useRef(false);
   const runtimeCheckRef = useRef(0);
+  const startPromiseRef = useRef(null);
+  const autoRestartAtRef = useRef(0);
   const activeConversation = conversations.find(c => c.id === activeId) || null;
 
   useEffect(() => { saveState({ baseUrl, selectedModel, activeId, projectRoot }); }, [baseUrl, selectedModel, activeId, projectRoot]);
@@ -84,7 +86,25 @@ export default function DesktopApp() {
   useEffect(() => { void desktopInvoke('system_hardware_info').then(setSystemInfo).catch(() => {}); }, []);
   useEffect(() => { let unlisten; listen('vertex-runtime-progress', event => setRuntimeProgress(event.payload)).then(fn => { unlisten = fn; }).catch(() => {}); return () => unlisten?.(); }, []);
   useEffect(() => { let offOutput, offExit, offStarted; listen('vertex-terminal-output', event => { const item = event.payload; if (!terminalPidRef.current || item.pid === terminalPidRef.current) { terminalInstanceRef.current?.write(item.text); } }).then(fn => { offOutput = fn; }).catch(() => {}); listen('vertex-terminal-exit', event => { const item = event.payload; if (!terminalPidRef.current || item.pid === terminalPidRef.current) { terminalInstanceRef.current?.writeln(`\r\n[Processus terminé · code ${item.code ?? 'inconnu'}]`); terminalPidRef.current = null; setTerminalPid(null); } }).then(fn => { offExit = fn; }).catch(() => {}); listen('vertex-terminal-started', event => { terminalPidRef.current = event.payload.pid; setTerminalPid(event.payload.pid); }).then(fn => { offStarted = fn; }).catch(() => {}); return () => { offOutput?.(); offExit?.(); offStarted?.(); }; }, []);
-  useEffect(() => { let alive = true; (async () => { const first = await getOllamaStatus(baseUrl); if (!first.online && baseUrl.replace(/\/+$/, '') === DEFAULT_OLLAMA_URL) { try { notify('Préparation du moteur IA intégré…'); await desktopInvoke('ollama_start'); await waitForOllama(DEFAULT_OLLAMA_URL, 45000); } catch (e) { notify(`Moteur local indisponible : ${String(e)}`); } } if (alive) await refreshRuntime(); })(); const timer = window.setInterval(() => void refreshRuntime(), 10000); return () => { alive = false; clearInterval(timer); }; }, [baseUrl]);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      if (baseUrl.replace(/\/+$/, '') === DEFAULT_OLLAMA_URL) {
+        await startEngine();
+      }
+      if (alive) await refreshRuntime();
+    })();
+    const timer = window.setInterval(async () => {
+      if (!alive) return;
+      const live = await refreshRuntime();
+      const isEmbedded = baseUrl.replace(/\/+$/, '') === DEFAULT_OLLAMA_URL;
+      if (alive && isEmbedded && !live.online && !startPromiseRef.current && Date.now() - autoRestartAtRef.current > 30000) {
+        autoRestartAtRef.current = Date.now();
+        void startEngine();
+      }
+    }, 8000);
+    return () => { alive = false; clearInterval(timer); };
+  }, [baseUrl]);
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [activeConversation?.messages?.length, activeConversation?.messages?.at(-1)?.content]);
   useEffect(() => {
     if (page !== 'workspace' || !projectRoot || !terminalMountRef.current) return;
@@ -125,21 +145,35 @@ export default function DesktopApp() {
   }, [baseUrl, selectedModel]);
 
   async function startEngine() {
-    if (baseUrl.replace(/\/+$/, '') !== DEFAULT_OLLAMA_URL) { notify(`L’adresse configurée est ${baseUrl}. Le moteur intégré Vertex AI utilise ${DEFAULT_OLLAMA_URL}. Remets cette adresse pour démarrer le moteur intégré.`); return false; }
-    setRuntimeProgress({ phase: 'prepare', label: 'Démarrage et vérification du moteur…' });
-    try {
-      const message = await desktopInvoke('ollama_start');
-      const ready = await waitForOllama(DEFAULT_OLLAMA_URL, 45000);
-      if (!ready.online) throw new Error(ready.error || 'L’API du moteur ne répond pas.');
-      await refreshRuntime();
-      setRuntimeProgress({ phase: 'started', label: 'Vertex Local Engine démarré et vérifié' });
-      notify(message || `Moteur prêt · Ollama ${ready.version}`);
-      return true;
-    } catch (error) {
-      await refreshRuntime();
-      notify(`Démarrage impossible : ${String(error)}`);
+    if (baseUrl.replace(/\/+$/, '') !== DEFAULT_OLLAMA_URL) {
+      notify(`L’adresse configurée est ${baseUrl}. Le moteur intégré utilise ${DEFAULT_OLLAMA_URL}.`);
       return false;
     }
+    if (startPromiseRef.current) return startPromiseRef.current;
+    const task = (async () => {
+      setRuntimeProgress({ phase: 'prepare', label: 'Démarrage et vérification du moteur…' });
+      try {
+        const message = await desktopInvoke('ollama_start');
+        const ready = await waitForOllama(DEFAULT_OLLAMA_URL, 95000);
+        if (!ready.online) throw new Error(ready.error || 'L’API du moteur ne répond pas après le démarrage.');
+        await refreshRuntime();
+        setRuntimeProgress({ phase: 'started', label: 'Vertex Local Engine démarré et vérifié' });
+        setStatus({ online: true, version: ready.version || 'connecté' });
+        notify(message || `Moteur prêt · Ollama ${ready.version}`);
+        return true;
+      } catch (error) {
+        const failed = { online: false, error: String(error) };
+        setStatus(failed);
+        setModels([]);
+        setRunningModels([]);
+        setRuntimeProgress({ phase: 'error', label: `Démarrage impossible : ${String(error)}` });
+        notify(`Démarrage impossible : ${String(error)}`);
+        return false;
+      }
+    })();
+    startPromiseRef.current = task;
+    try { return await task; }
+    finally { if (startPromiseRef.current === task) startPromiseRef.current = null; }
   }
 
   async function openProject(path, skipDirtyCheck = false) {
@@ -163,7 +197,11 @@ export default function DesktopApp() {
   function updateConversation(id, fn) { setConversations(current => current.map(c => c.id === id ? fn(c) : c)); }
   async function sendMessage(text = draft) {
     const prompt = text.trim(); if (!prompt || busy) return;
-    if (!status.online) { notify('Le moteur local ne répond pas. Relance Vertex Local Engine depuis Runtime.'); return; }
+    if (!status.online) {
+      const started = await startEngine();
+      if (!started) return;
+      await refreshRuntime();
+    }
     if (!selectedModel || !models.some(m => m.name === selectedModel)) { notify('Télécharge ou sélectionne un modèle local avant de discuter.'); setPage('models'); return; }
     let conversation = activeConversation;
     if (!conversation) { conversation = { id: makeId(), title: prompt.slice(0, 54), model: selectedModel, updatedAt: Date.now(), messages: [] }; setConversations(current => [conversation, ...current]); setActiveId(conversation.id); }
@@ -188,11 +226,15 @@ export default function DesktopApp() {
     finally { setCatalogLoading(false); }
   }
   async function downloadModel(model) {
-    const liveStatus = await getOllamaStatus(baseUrl);
+    let liveStatus = await getOllamaStatus(baseUrl);
+    if (!liveStatus.online && baseUrl.replace(/\/+$/, '') === DEFAULT_OLLAMA_URL) {
+      const started = await startEngine();
+      if (started) liveStatus = await getOllamaStatus(baseUrl);
+    }
     setStatus(liveStatus);
     if (!liveStatus.online) {
       setModels([]); setRunningModels([]);
-      notify(`Vertex Local Engine est hors ligne. Démarre-le avant le téléchargement. ${liveStatus.error || ''}`);
+      notify(`Le moteur local n'est toujours pas disponible. ${liveStatus.error || ''}`);
       return;
     }
     setPulling(p => ({ ...p, [model]: { status: 'Préparation…', percent: 0 } }));
@@ -321,7 +363,7 @@ export default function DesktopApp() {
 
       {page === 'runtime' && <section className="desktop-page"><div className="desktop-page-heading"><div><div className="desktop-eyebrow">LOCAL INFERENCE ENGINE</div><h1>Runtime</h1><p>Contrôle le moteur local intégré à Vertex AI et surveille les modèles installés.</p></div><button className="desktop-secondary-btn" onClick={() => void refreshRuntime()}><Icon name="refresh" size={15}/> Actualiser</button></div>{runtimeProgress && !status.online && <div className="runtime-help"><b>{runtimeProgress.label || 'Préparation du moteur local'}</b>{runtimeProgress.phase === 'download' && <><p>{runtimeProgress.total ? `${(runtimeProgress.received/1073741824).toFixed(2)} / ${(runtimeProgress.total/1073741824).toFixed(2)} Go` : 'Téléchargement en cours…'}</p><div style={{height:6,background:'rgba(255,255,255,.1)',borderRadius:99,overflow:'hidden'}}><div style={{height:'100%',width:`${runtimeProgress.percent || 0}%`,background:'linear-gradient(90deg,#f97316,#3b82f6)',transition:'width .2s'}}/></div></>}</div>}<div className={`runtime-hero ${status.online?'online':''}`}><div className="runtime-hero-icon"><Icon name="cpu" size={27}/></div><div><span>VERTEX LOCAL ENGINE · OLLAMA EMBARQUÉ</span><h2>{status.online ? 'Moteur opérationnel' : 'Initialisation du moteur intégré requise'}</h2><p>{status.online ? `Version ${status.version} · ${models.length} modèle(s) installé(s)` : 'Vertex AI prépare automatiquement son moteur local au premier démarrage.'}</p></div><button onClick={() => void startEngine()}><Icon name="play" size={15}/> Démarrer le moteur</button></div><div className="runtime-stats"><div><small>CPU</small><b>{systemInfo.cpuName || 'Détection…'} · {systemInfo.cpuCores || '—'} cœurs</b><small>Charge {Number(systemInfo.cpuUsage || 0).toFixed(1)}%</small></div><div><small>MÉMOIRE RAM</small><b>{systemInfo.ramTotal ? `${(systemInfo.ramUsed/1073741824).toFixed(1)} / ${(systemInfo.ramTotal/1073741824).toFixed(1)} Go` : '—'}</b></div><div><small>GPU DÉTECTÉ</small><b>{systemInfo.gpus?.length ? systemInfo.gpus.join(' · ') : 'Informations non disponibles'}</b></div><div><small>MODÈLES LOCAUX</small><b>{models.length}</b></div><div><small>ENDPOINT</small><b>{baseUrl}</b></div><div><small>STATUT</small><b className={status.online?'text-good':'text-warn'}>{status.online?'Connecté':'Hors ligne'}</b></div></div><div className="runtime-actions"><button className="desktop-secondary-btn" onClick={refreshHardware}>Actualiser le matériel</button><button className="desktop-secondary-btn" onClick={()=>repairLocalRuntime()}>Réparer / mettre à jour le moteur intégré</button></div><h3 className="section-title">Modèles installés</h3>{models.map(m=><div className="runtime-model" key={m.name}><Icon name="brain" size={18}/><div><b>{m.name}</b><small>{m.details?.parameter_size || 'Modèle local'} · {m.details?.quantization_level || 'Quantification inconnue'} · {runningModels.some(r=>r.name===m.name)?'Chargé en mémoire':'Arrêté'}</small></div><span>{formatBytes(m.size)}</span><button onClick={()=>void inspectModel(m.name)} title="Détails et quantification"><Icon name="info" size={14}/></button><button onClick={()=>void removeModel(m.name)} title="Supprimer"><Icon name="trash" size={15}/></button></div>)}{!models.length && <p className="muted-copy">Aucun modèle installé.</p>}{modelDetails && <div className="runtime-help model-details-panel"><b>Détails : {modelDetailsName}</b><p>Variantes disponibles sur Ollama : {modelTags.length ? modelTags.join(' · ') : 'Liste non exposée pour ce modèle.'}</p><p>{modelDetails.details?.parameter_size || 'Paramètres non renseignés'} · {modelDetails.details?.quantization_level || 'Quantification non renseignée'}</p><p>Famille : {modelDetails.details?.family || '—'} · Formats : {(modelDetails.details?.families || []).join(', ') || '—'}</p><p>{(modelDetails.capabilities || []).join(' · ')}</p><details><summary>Afficher le modèle et les variantes</summary><pre>{JSON.stringify({modelfile:modelDetails.modelfile,parameters:modelDetails.parameters,template:modelDetails.template},null,2)}</pre></details></div>}<div className="runtime-help"><b>Moteur autonome Vertex AI</b><p>Le moteur Ollama officiel est fourni avec Vertex AI et s'exécute dans son espace privé. Aucun Ollama externe, terminal ou gestionnaire de paquets n'est nécessaire. Les modèles sont téléchargés séparément à la demande.</p></div></section>}
 
-      {page === 'settings' && <section className="desktop-page"><div className="desktop-page-heading"><div><div className="desktop-eyebrow">PREFERENCES</div><h1>Settings</h1><p>Configure Vertex AI Desktop et ton environnement local.</p></div></div><div className="settings-layout"><aside>{[['general','Général'],['ollama','Moteur local'],['privacy','Confidentialité'],['about','À propos']].map(([id,label])=><button className={settingsTab===id?'active':''} onClick={()=>setSettingsTab(id)} key={id}>{label}</button>)}</aside><div className="settings-content">{settingsTab==='general'&&<><h3>Général</h3><label className="setting-row"><span><b>Langue de l'interface</b><small>Langue de Vertex AI Desktop</small></span><select defaultValue="fr"><option value="fr">Français</option><option value="en">English (bientôt)</option></select></label><label className="setting-row"><span><b>Modèle par défaut</b><small>Utilisé pour les nouvelles conversations</small></span><select value={selectedModel} onChange={e=>setSelectedModel(e.target.value)}><option value="">Aucun</option>{models.map(m=><option key={m.name}>{m.name}</option>)}</select></label></>}{settingsTab==='ollama'&&<><h3>Vertex Local Engine</h3><label className="setting-row"><span><b>Adresse du moteur local</b><small>API privée du runtime embarqué</small></span><input value={baseUrl} onChange={e=>setBaseUrl(e.target.value)} placeholder="http://127.0.0.1:11435"/></label><button className="desktop-primary-btn" onClick={()=>void refreshRuntime()}>Tester la connexion</button></>}{settingsTab==='privacy'&&<><h3>Confidentialité et sécurité</h3><div className="privacy-note"><Icon name="shieldCheck" size={20}/><p>Les messages et fichiers restent sur cet ordinateur et sont envoyés au moteur local intégré (Ollama embarqué). Les recherches de modèles utilisent la bibliothèque publique Ollama. Aucune clé fournisseur cloud n'est requise.</p></div><ul><li>Les accès fichiers sont limités au dossier de projet ouvert.</li><li>Les commandes sont exécutées après confirmation.</li><li>Les suppressions de modèles nécessitent une confirmation.</li><li>Les conversations, projets récents et points de restauration sont stockés dans une base SQLite locale.</li></ul></>}{settingsTab==='about'&&<><h3>Vertex AI Desktop</h3><p>Version 2.9.1 · Vertex Studio</p><p>Application Desktop basée sur React/JavaScript, Vite, Rust et Tauri 2.</p><a href="https://ollama.com" target="_blank" rel="noreferrer">Ollama <Icon name="external" size={13}/></a></>}</div></div></section>}
+      {page === 'settings' && <section className="desktop-page"><div className="desktop-page-heading"><div><div className="desktop-eyebrow">PREFERENCES</div><h1>Settings</h1><p>Configure Vertex AI Desktop et ton environnement local.</p></div></div><div className="settings-layout"><aside>{[['general','Général'],['ollama','Moteur local'],['privacy','Confidentialité'],['about','À propos']].map(([id,label])=><button className={settingsTab===id?'active':''} onClick={()=>setSettingsTab(id)} key={id}>{label}</button>)}</aside><div className="settings-content">{settingsTab==='general'&&<><h3>Général</h3><label className="setting-row"><span><b>Langue de l'interface</b><small>Langue de Vertex AI Desktop</small></span><select defaultValue="fr"><option value="fr">Français</option><option value="en">English (bientôt)</option></select></label><label className="setting-row"><span><b>Modèle par défaut</b><small>Utilisé pour les nouvelles conversations</small></span><select value={selectedModel} onChange={e=>setSelectedModel(e.target.value)}><option value="">Aucun</option>{models.map(m=><option key={m.name}>{m.name}</option>)}</select></label></>}{settingsTab==='ollama'&&<><h3>Vertex Local Engine</h3><label className="setting-row"><span><b>Adresse du moteur local</b><small>API privée du runtime embarqué</small></span><input value={baseUrl} onChange={e=>setBaseUrl(e.target.value)} placeholder="http://127.0.0.1:11435"/></label><button className="desktop-primary-btn" onClick={()=>void refreshRuntime()}>Tester la connexion</button></>}{settingsTab==='privacy'&&<><h3>Confidentialité et sécurité</h3><div className="privacy-note"><Icon name="shieldCheck" size={20}/><p>Les messages et fichiers restent sur cet ordinateur et sont envoyés au moteur local intégré (Ollama embarqué). Les recherches de modèles utilisent la bibliothèque publique Ollama. Aucune clé fournisseur cloud n'est requise.</p></div><ul><li>Les accès fichiers sont limités au dossier de projet ouvert.</li><li>Les commandes sont exécutées après confirmation.</li><li>Les suppressions de modèles nécessitent une confirmation.</li><li>Les conversations, projets récents et points de restauration sont stockés dans une base SQLite locale.</li></ul></>}{settingsTab==='about'&&<><h3>Vertex AI Desktop</h3><p>Version 2.9.2 · Vertex Studio</p><p>Application Desktop basée sur React/JavaScript, Vite, Rust et Tauri 2.</p><a href="https://ollama.com" target="_blank" rel="noreferrer">Ollama <Icon name="external" size={13}/></a></>}</div></div></section>}
     </main>
     {toast && <div className="desktop-toast"><Icon name="info" size={15}/>{toast}</div>}
     {confirmAction && <div className="desktop-modal-scrim"><div className="desktop-confirm-modal"><div className="confirm-icon"><Icon name="shieldAlert" size={23}/></div><h3>{confirmAction.title}</h3><p>{confirmAction.description}</p><div><button onClick={()=>setConfirmAction(null)}>Annuler</button><button className="danger-confirm" onClick={async()=>{const action=confirmAction;setConfirmAction(null);try{await action.run();}catch(e){notify(String(e));}}}>Confirmer</button></div></div></div>}
