@@ -285,6 +285,9 @@ const OLLAMA_WINDOWS_URL: &str = "https://github.com/ollama/ollama/releases/late
 const OLLAMA_WINDOWS_ROCM_URL: &str = "https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64-rocm.zip";
 static OLLAMA_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
 static OLLAMA_START_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+fn ollama_start_lock() -> &'static tokio::sync::Mutex<()> {
+    OLLAMA_START_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 static TERMINAL_PIDS: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
 fn child_slot() -> &'static Mutex<Option<Child>> { OLLAMA_CHILD.get_or_init(|| Mutex::new(None)) }
