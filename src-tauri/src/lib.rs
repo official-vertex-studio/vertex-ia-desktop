@@ -244,7 +244,7 @@ async fn ollama_chat(app: AppHandle, base_url: String, model: String, messages: 
                     let _ = app.emit("ollama-chat-token", content.to_string());
                 }
                 if value.get("done").and_then(|v| v.as_bool()) == Some(true) {
-                    let _ = app.emit("ollama-chat-done", &value);
+                    let _ = app.emit("ollama-chat-done", value);
                 }
                 if let Some(error) = value.get("error").and_then(|v| v.as_str()) { return Err(error.to_string()); }
             }
@@ -257,6 +257,10 @@ async fn ollama_chat(app: AppHandle, base_url: String, model: String, messages: 
 
 #[tauri::command]
 async fn ollama_pull(app: AppHandle, base_url: String, model: String) -> Result<(), String> {
+    let health_url = format!("{}/api/version", base_url.trim_end_matches('/'));
+    reqwest::Client::new().get(&health_url).timeout(std::time::Duration::from_secs(5)).send().await
+        .map_err(|e| format!("Vertex Local Engine inaccessible sur {base_url}. Démarre le moteur puis réessaie : {e}"))?
+        .error_for_status().map_err(|e| format!("L'API Ollama ne répond pas correctement sur {base_url} : {e}"))?;
     let url = format!("{}/api/pull", base_url.trim_end_matches('/'));
     let mut response = reqwest::Client::new().post(url).json(&serde_json::json!({"model": model, "stream": true})).timeout(std::time::Duration::from_secs(7200)).send().await.map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?;
     let mut buffer = Vec::new();
@@ -384,19 +388,62 @@ async fn provision_embedded_runtime(app: &AppHandle, force_download: bool) -> Re
     find_ollama_executable(&runtime).ok_or_else(|| "Le moteur a été extrait, mais ollama.exe est introuvable dans l'archive officielle.".into())
 }
 
+async fn embedded_ollama_ready(timeout: Duration) -> bool {
+    let client = match reqwest::Client::builder().connect_timeout(Duration::from_secs(2)).timeout(Duration::from_secs(3)).build() {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    let url = format!("http://{}/api/version", VERTEX_OLLAMA_HOST);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(response) = client.get(&url).send().await {
+            if let Ok(response) = response.error_for_status() {
+                if response.json::<serde_json::Value>().await.is_ok() { return true; }
+            }
+        }
+        if std::time::Instant::now() >= deadline { return false; }
+        tokio::time::sleep(Duration::from_millis(350)).await;
+    }
+}
+
 async fn start_embedded_ollama(app: &AppHandle, force_download: bool) -> Result<String, String> {
     #[cfg(not(windows))] { let _ = app; let _ = force_download; return Err("Cette version All-in-One est actuellement prévue pour Windows x64.".into()); }
     #[cfg(windows)] {
-        if !force_download {
-            if let Ok(mut slot) = child_slot().lock() {
-                let running = slot.as_mut().map(|child| child.try_wait().map(|status| status.is_none())).transpose().map_err(|e| e.to_string())?;
-                if running == Some(true) { return Ok("Vertex Local Engine est déjà actif.".into()); }
-                if running == Some(false) { *slot = None; }
+        if force_download {
+            stop_embedded_ollama();
+        } else {
+            let child_running = {
+                let mut slot = child_slot().lock().map_err(|_| "Registre du moteur local indisponible")?;
+                let state = match slot.as_mut() {
+                    Some(child) => Some(child.try_wait().map_err(|e| format!("Impossible de vérifier le processus Ollama : {e}"))?),
+                    None => None,
+                };
+                match state {
+                    Some(None) => true,
+                    Some(Some(_)) => { *slot = None; false },
+                    None => false,
+                }
+            };
+            if child_running {
+                if embedded_ollama_ready(Duration::from_secs(18)).await {
+                    return Ok("Vertex Local Engine est actif et son API répond correctement.".into());
+                }
+                stop_embedded_ollama();
             }
-        } else { stop_embedded_ollama(); }
+        }
+
         let executable = provision_embedded_runtime(app, force_download).await?;
-        let listener = TcpListener::bind(VERTEX_OLLAMA_HOST).map_err(|_| "Le port local 11435 est déjà utilisé. Ferme l'autre application qui utilise ce port, puis relance Vertex AI.".to_string())?;
+        let listener = match TcpListener::bind(VERTEX_OLLAMA_HOST) {
+            Ok(listener) => listener,
+            Err(_) => {
+                if embedded_ollama_ready(Duration::from_secs(4)).await {
+                    return Ok("Un moteur Ollama répond déjà sur le port local configuré. Vertex AI peut l'utiliser.".into());
+                }
+                return Err("Le port local 11435 est occupé, mais aucun moteur Ollama ne répond dessus. Ferme le processus qui utilise ce port puis réessaie.".into());
+            }
+        };
         drop(listener);
+
         let models = models_directory(app)?;
         let mut command = Command::new(&executable);
         command.arg("serve").env("OLLAMA_HOST", VERTEX_OLLAMA_HOST).env("OLLAMA_MODELS", models)
@@ -404,10 +451,15 @@ async fn start_embedded_ollama(app: &AppHandle, force_download: bool) -> Result<
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
-        let child = command.spawn().map_err(|e| format!("Impossible de démarrer le moteur Vertex Local: {e}"))?;
+        let child = command.spawn().map_err(|e| format!("Impossible de démarrer le moteur Vertex Local ({}): {e}", executable.display()))?;
         if let Ok(mut slot) = child_slot().lock() { *slot = Some(child); }
-        let _ = app.emit("vertex-runtime-progress", serde_json::json!({"phase":"started","label":"Vertex Local Engine démarré"}));
-        Ok("Vertex Local Engine est démarré. Les modèles seront stockés dans les données locales de Vertex AI.".into())
+
+        if !embedded_ollama_ready(Duration::from_secs(45)).await {
+            stop_embedded_ollama();
+            return Err("Ollama a été lancé, mais son API n'a pas répondu après 45 secondes. Vérifie l'espace disque et les droits du dossier LocalAppData, puis utilise Réparer le moteur.".into());
+        }
+        let _ = app.emit("vertex-runtime-progress", serde_json::json!({"phase":"started","label":"Vertex Local Engine démarré et vérifié"}));
+        Ok("Vertex Local Engine est démarré et son API est prête. Les modèles peuvent être téléchargés.".into())
     }
 }
 
@@ -487,17 +539,7 @@ fn db_restore_snapshot(app: AppHandle, id: String) -> Result<(), String> {
 fn system_hardware_info() -> Result<serde_json::Value, String> {
     let mut sys=System::new_all(); sys.refresh_all();
     let mut gpu=Vec::<String>::new();
-    #[cfg(windows)] {
-        let nvidia = Command::new("nvidia-smi").args(["--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"]).output();
-        if let Ok(out) = nvidia { if out.status.success() {
-            for line in String::from_utf8_lossy(&out.stdout).lines() { let parts: Vec<&str> = line.split(',').map(str::trim).collect(); if parts.len() >= 3 { gpu.push(format!("{} | {} MB VRAM | Driver {}", parts[0], parts[1], parts[2])); } }
-        } }
-        if gpu.is_empty() {
-            if let Ok(out) = Command::new("powershell").args(["-NoProfile", "-Command", "Get-CimInstance Win32_VideoController | ForEach-Object { $vram = [math]::Round($_.AdapterRAM / 1GB, 2); \"$($_.Name) | VRAM rapportée par Windows: ${vram} GB | Driver $($_.DriverVersion)\" }"]).output() {
-                for line in String::from_utf8_lossy(&out.stdout).lines() { if !line.trim().is_empty() { gpu.push(line.to_string()); } }
-            }
-        }
-    }
+    #[cfg(windows)] { if let Ok(out)=Command::new("powershell").args(["-NoProfile","-Command","Get-CimInstance Win32_VideoController | ForEach-Object { $vram = [math]::Round($_.AdapterRAM / 1GB, 2); \"$($_.Name) | ${vram} GB VRAM\" }"]).output(){ for line in String::from_utf8_lossy(&out.stdout).lines(){let p:Vec<&str>=line.split('|').collect();if !p.is_empty(){gpu.push(line.to_string());}} } }
     #[cfg(target_os="linux")] { if let Ok(out)=Command::new("sh").args(["-lc","(command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader) || lspci 2>/dev/null | grep -Ei 'vga|3d'"]).output(){gpu=String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect();} }
     #[cfg(target_os="macos")] { if let Ok(out)=Command::new("system_profiler").arg("SPDisplaysDataType").output(){gpu=String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|l|l.contains("Chipset Model")||l.contains("VRAM")||l.contains("Total Number of Cores")).map(str::to_string).collect();} }
     Ok(serde_json::json!({"os":System::long_os_version().unwrap_or_else(||std::env::consts::OS.into()),"host":System::host_name().unwrap_or_default(),"cpuName":sys.cpus().first().map(|c|c.brand().to_string()).unwrap_or_default(),"cpuCores":sys.cpus().len(),"cpuUsage":sys.global_cpu_usage(),"ramTotal":sys.total_memory(),"ramUsed":sys.used_memory(),"gpus":gpu}))

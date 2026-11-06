@@ -9,6 +9,18 @@ export async function getOllamaStatus(baseUrl = DEFAULT_OLLAMA_URL) {
   catch (error) { return { online: false, error: String(error) }; }
 }
 
+export async function waitForOllama(baseUrl = DEFAULT_OLLAMA_URL, timeoutMs = 45000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastStatus = { online: false, error: 'Le moteur ne répond pas encore.' };
+  do {
+    lastStatus = await getOllamaStatus(baseUrl);
+    if (lastStatus.online) return lastStatus;
+    if (Date.now() >= deadline) break;
+    await new Promise(resolve => window.setTimeout(resolve, 400));
+  } while (Date.now() < deadline);
+  return lastStatus;
+}
+
 export async function listLocalModels(baseUrl = DEFAULT_OLLAMA_URL) {
   const result = await invoke('ollama_local_models', { baseUrl });
   return result.models || [];

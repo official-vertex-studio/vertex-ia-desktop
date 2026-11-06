@@ -1,6 +1,6 @@
 [package]
 name = "vertex-ai-desktop"
-version = "2.9.0"
+version = "2.9.1"
 description = "VERTEX AI Desktop — standalone local AI workspace"
 authors = ["Vertex Studio"]
 edition = "2021"
