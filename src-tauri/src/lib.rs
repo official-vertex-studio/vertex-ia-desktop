@@ -282,7 +282,6 @@ async fn ollama_pull(app: AppHandle, base_url: String, model: String) -> Result<
 
 const VERTEX_OLLAMA_HOST: &str = "127.0.0.1:11435";
 const OLLAMA_WINDOWS_URL: &str = "https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64.zip";
-const OLLAMA_WINDOWS_ROCM_URL: &str = "https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64-rocm.zip";
 static OLLAMA_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
 static OLLAMA_START_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 fn ollama_start_lock() -> &'static tokio::sync::Mutex<()> {
@@ -359,18 +358,59 @@ async fn download_runtime_archive(app: &AppHandle, url: &str, target: &Path, lab
     Ok(())
 }
 
-fn extract_runtime_archive(archive_path: &Path, destination: &Path) -> Result<(), String> {
+fn extract_runtime_archive(
+    app: &AppHandle,
+    archive_path: &Path,
+    destination: &Path,
+    label: &str,
+) -> Result<(), String> {
     let file = fs::File::open(archive_path).map_err(|e| format!("Archive moteur introuvable: {e}"))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Archive moteur illisible: {e}"))?;
+    let mut total_bytes = 0u64;
     for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).map_err(|e| e.to_string())?;
-        let Some(relative) = entry.enclosed_name().map(|p| p.to_path_buf()) else { continue; };
-        let output = destination.join(relative);
-        if entry.is_dir() { fs::create_dir_all(&output).map_err(|e| e.to_string())?; continue; }
-        if let Some(parent) = output.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
-        let mut out = fs::File::create(&output).map_err(|e| e.to_string())?;
-        std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+        let entry = archive.by_index(index).map_err(|e| format!("Lecture de l'archive impossible: {e}"))?;
+        if !entry.is_dir() { total_bytes = total_bytes.saturating_add(entry.size()); }
     }
+    let mut extracted = 0u64;
+    let mut last_reported = 0u64;
+    fs::create_dir_all(destination).map_err(|e| format!("Création du dossier temporaire impossible: {e}"))?;
+    let _ = app.emit("vertex-runtime-progress", serde_json::json!({
+        "phase":"extract", "label":format!("Extraction de {label}"),
+        "received":0, "total":total_bytes, "percent":0
+    }));
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|e| format!("Lecture de l'entrée ZIP impossible: {e}"))?;
+        let Some(relative) = entry.enclosed_name().map(|p| p.to_path_buf()) else { continue; };
+        // Ignore ZIP symbolic links: the runtime only needs regular files/directories.
+        if entry.unix_mode().map(|mode| (mode & 0o170000) == 0o120000).unwrap_or(false) { continue; }
+        let output = destination.join(relative);
+        if entry.is_dir() {
+            fs::create_dir_all(&output).map_err(|e| format!("Création d'un dossier du moteur impossible: {e}"))?;
+            continue;
+        }
+        if let Some(parent) = output.parent() { fs::create_dir_all(parent).map_err(|e| format!("Création d'un dossier du moteur impossible: {e}"))?; }
+        let mut out = fs::File::create(&output).map_err(|e| format!("Création d'un fichier du moteur impossible: {e}"))?;
+        let mut buffer = [0u8; 8 * 1024 * 1024];
+        loop {
+            let read = entry.read(&mut buffer).map_err(|e| format!("Décompression du moteur impossible: {e}"))?;
+            if read == 0 { break; }
+            out.write_all(&buffer[..read]).map_err(|e| format!("Écriture du moteur impossible: {e}"))?;
+            extracted = extracted.saturating_add(read as u64);
+            if extracted.saturating_sub(last_reported) >= 16 * 1024 * 1024 || extracted >= total_bytes {
+                last_reported = extracted;
+                let percent = if total_bytes > 0 { ((extracted as f64 / total_bytes as f64) * 100.0).round() as u32 } else { 0 };
+                let _ = app.emit("vertex-runtime-progress", serde_json::json!({
+                    "phase":"extract", "label":format!("Extraction de {label}"),
+                    "received":extracted, "total":total_bytes, "percent":percent.min(100)
+                }));
+            }
+        }
+    }
+    let _ = app.emit("vertex-runtime-progress", serde_json::json!({
+        "phase":"extract", "label":format!("Extraction de {label} terminée"),
+        "received":total_bytes, "total":total_bytes, "percent":100
+    }));
     Ok(())
 }
 
@@ -380,51 +420,99 @@ fn find_ollama_executable(directory: &Path) -> Option<PathBuf> {
         .map(|entry| entry.path().to_path_buf())
 }
 
-fn amd_gpu_present() -> bool {
-    #[cfg(windows)] {
-        return Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", "(Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name) -join ';'"]).output().map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("amd") || String::from_utf8_lossy(&o.stdout).to_lowercase().contains("radeon")).unwrap_or(false);
-    }
-    #[cfg(not(windows))] { false }
-}
-
 async fn provision_embedded_runtime(app: &AppHandle, force_download: bool) -> Result<PathBuf, String> {
     let runtime = runtime_directory(app)?;
     if !force_download {
         if let Some(exe) = find_ollama_executable(&runtime) {
             let version = Command::new(&exe).arg("--version").output();
             if version.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+                append_runtime_log(app, &format!("Runtime existant validé : {}", exe.display()));
                 return Ok(exe);
             }
-            append_runtime_log(app, &format!("Runtime existant invalide, réinstallation automatique : {}", exe.display()));
+            append_runtime_log(app, &format!("Runtime existant invalide, remplacement automatique : {}", exe.display()));
         }
     }
-    let _ = app.emit("vertex-runtime-progress", serde_json::json!({"phase":"prepare","label":"Préparation automatique du moteur IA local"}));
-    if force_download { let _ = fs::remove_dir_all(&runtime); fs::create_dir_all(&runtime).map_err(|e| e.to_string())?; }
-    let base_archive = runtime.join("ollama-windows-amd64.zip");
+
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    let cache = local_data.join("runtime-cache");
+    fs::create_dir_all(&cache).map_err(|e| format!("Création du cache runtime impossible: {e}"))?;
+    let base_archive = cache.join("ollama-windows-amd64.zip");
+    let staging = cache.join(format!("ollama-staging-{}", std::process::id()));
+    let backup = cache.join(format!("ollama-backup-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&staging);
+    let _ = fs::remove_dir_all(&backup);
+    fs::create_dir_all(&staging).map_err(|e| format!("Création du dossier temporaire impossible: {e}"))?;
+
     let mut bundled = false;
     if !force_download {
         if let Some(source) = bundled_resource(app, "ollama-windows-amd64.zip") {
-            if source.is_file() { fs::copy(source, &base_archive).map_err(|e| format!("Copie du moteur embarqué impossible: {e}"))?; bundled = true; }
+            append_runtime_log(app, &format!("Runtime embarqué trouvé : {}", source.display()));
+            if source.is_file() {
+                fs::copy(source, &base_archive).map_err(|e| format!("Copie du moteur embarqué impossible: {e}"))?;
+                bundled = true;
+            }
+        } else {
+            append_runtime_log(app, "Archive embarquée absente ; téléchargement de secours activé.");
         }
     }
-    if !bundled { download_runtime_archive(app, OLLAMA_WINDOWS_URL, &base_archive, "Moteur Ollama x64").await?; }
-    let _ = app.emit("vertex-runtime-progress", serde_json::json!({"phase":"extract","label":"Installation du moteur local"}));
-    extract_runtime_archive(&base_archive, &runtime)?;
+    if !bundled {
+        download_runtime_archive(app, OLLAMA_WINDOWS_URL, &base_archive, "Moteur Ollama x64").await?;
+    }
+
+    let extraction_result = extract_runtime_archive(app, &base_archive, &staging, "moteur Ollama x64");
+    if extraction_result.is_err() && bundled && !force_download {
+        append_runtime_log(app, "Archive embarquée illisible/incomplète ; nouvelle récupération depuis les releases officielles.");
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+        download_runtime_archive(app, OLLAMA_WINDOWS_URL, &base_archive, "Moteur Ollama x64 (secours)").await?;
+        extract_runtime_archive(app, &base_archive, &staging, "moteur Ollama x64 (secours)").map_err(|e| {
+            let _ = fs::remove_dir_all(&staging);
+            format!("Extraction du runtime impossible après récupération : {e}")
+        })?;
+    } else {
+        extraction_result.map_err(|e| {
+            let _ = fs::remove_dir_all(&staging);
+            format!("Extraction du runtime impossible : {e}")
+        })?;
+    }
     let _ = fs::remove_file(&base_archive);
 
-    if amd_gpu_present() {
-        let rocm_archive = runtime.join("ollama-windows-amd64-rocm.zip");
-        let mut rocm_bundled = false;
-        if !force_download {
-            if let Some(source) = bundled_resource(app, "ollama-windows-amd64-rocm.zip") {
-                if source.is_file() { fs::copy(source, &rocm_archive).map_err(|e| e.to_string())?; rocm_bundled = true; }
-            }
+    let staged_exe = match find_ollama_executable(&staging) {
+        Some(exe) => exe,
+        None => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err("L'archive a été extraite, mais ollama.exe est introuvable. Le runtime téléchargé n'est pas valide.".into());
         }
-        if !rocm_bundled { download_runtime_archive(app, OLLAMA_WINDOWS_ROCM_URL, &rocm_archive, "Accélération AMD ROCm").await?; }
-        extract_runtime_archive(&rocm_archive, &runtime)?;
-        let _ = fs::remove_file(&rocm_archive);
+    };
+    let version_check = match Command::new(&staged_exe).current_dir(staged_exe.parent().unwrap_or(&staging)).arg("--version").output() {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(format!("Impossible de vérifier Ollama après extraction : {error}"));
+        }
+    };
+    if !version_check.status.success() {
+        let detail = String::from_utf8_lossy(&version_check.stderr);
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!("Le runtime extrait ne démarre pas (ollama --version). {}", detail.trim()));
     }
-    find_ollama_executable(&runtime).ok_or_else(|| "Le moteur a été extrait, mais ollama.exe est introuvable dans l'archive officielle.".into())
+    append_runtime_log(app, &format!("Runtime extrait et validé : {}", String::from_utf8_lossy(&version_check.stdout).trim()));
+
+    // Keep the previous runtime until the new one has been fully extracted and validated.
+    if runtime.exists() {
+        fs::rename(&runtime, &backup).map_err(|e| format!("Impossible de sauvegarder l'ancien runtime : {e}"))?;
+    }
+    if let Err(error) = fs::rename(&staging, &runtime) {
+        if backup.exists() { let _ = fs::rename(&backup, &runtime); }
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!("Impossible d'activer le nouveau runtime : {error}"));
+    }
+    let _ = fs::remove_dir_all(&backup);
+    let _ = app.emit("vertex-runtime-progress", serde_json::json!({
+        "phase":"ready", "label":"Moteur local installé et vérifié", "percent":100
+    }));
+    find_ollama_executable(&runtime)
+        .ok_or_else(|| "Le runtime a été activé, mais ollama.exe est introuvable.".into())
 }
 
 async fn embedded_ollama_ready(timeout: Duration) -> bool {
@@ -521,19 +609,10 @@ async fn start_embedded_ollama(app: &AppHandle, force_download: bool) -> Result<
     }
     match start_embedded_ollama_once(app, force_download).await {
         Ok(message) => Ok(message),
-        Err(first_error) if !force_download && !first_error.contains("port local 11435 est occupé") => {
-            append_runtime_log(app, &format!("Premier démarrage en échec : {first_error}. Tentative de réparation automatique."));
-            let _ = app.emit("vertex-runtime-progress", serde_json::json!({"phase":"repair","label":"Réparation automatique du moteur local…"}));
-            stop_embedded_ollama();
-            match start_embedded_ollama_once(app, true).await {
-                Ok(message) => Ok(format!("Moteur réparé automatiquement. {message}")),
-                Err(repair_error) => {
-                    append_runtime_log(app, &format!("Réparation automatique en échec : {repair_error}"));
-                    Err(format!("Démarrage impossible : {first_error}. Réparation automatique impossible : {repair_error}"))
-                }
-            }
+        Err(error) => {
+            append_runtime_log(app, &format!("Démarrage impossible : {error}"));
+            Err(error)
         }
-        Err(error) => { append_runtime_log(app, &format!("Démarrage impossible : {error}")); Err(error) }
     }
 }
 

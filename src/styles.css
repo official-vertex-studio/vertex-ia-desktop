@@ -597,13 +597,7 @@ kbd { flex: 0 0 auto; padding: 2px 4px; border: 1px solid var(--border-strong); 
 @media(max-width:700px){.workspace-layout{grid-template-columns:145px minmax(0,1fr)}.terminal-panel{flex-basis:190px}.editor-tabs .editor-tab{max-width:145px}}
 
 .xterm-host{flex:1;min-height:120px;overflow:hidden;padding:7px 10px 5px;background:#080d14}.xterm-host .xterm{height:100%;padding:0}.xterm-host .xterm-viewport{overflow-y:auto!important}.terminal-footnote{padding:4px 12px;border-top:1px solid rgba(255,255,255,.045);background:#0a111a;color:#536b84;font:8px 'DM Mono',monospace}
-.workspace-snapshots{margin:14px 7px 10px;padding-top:9px;border-top:1px solid rgba(255,255,255,.06)}
-.workspace-snapshots summary{display:flex;align-items:center;justify-content:space-between;cursor:pointer;color:#7890a9;font-size:8px;font-weight:700;letter-spacing:.1em;list-style:none}
-.workspace-snapshots summary::-webkit-details-marker{display:none}
-.workspace-snapshots summary span{padding:2px 6px;border-radius:9px;background:rgba(90,169,255,.1);color:#8fc4f6}
-.workspace-snapshots>div{display:flex;align-items:center;justify-content:space-between;gap:5px;margin-top:8px}
-.workspace-snapshots>div span{display:flex;min-width:0;flex-direction:column;gap:2px}
-.workspace-snapshots>div b{overflow:hidden;color:#a9bbcf;font-size:9px;text-overflow:ellipsis;white-space:nowrap}
-.workspace-snapshots>div small{color:#61758d;font-size:8px}
-.workspace-snapshots>div button{flex:0 0 auto;padding:4px 6px;border:1px solid rgba(90,169,255,.18);border-radius:5px;background:rgba(90,169,255,.07);color:#a6cdf3;font-size:8px}
-.workspace-snapshots>p{color:#5e7288;font-size:9px}
+
+
+/* Visible engine provisioning progress on every desktop page. */
+.runtime-global-progress{padding:9px 24px 10px;background:rgba(15,23,42,.72);border-bottom:1px solid rgba(148,163,184,.12);display:flex;flex-direction:column;gap:6px}.runtime-global-progress>div{display:flex;justify-content:space-between;gap:12px;color:#b8c5d6;font-size:11px}.runtime-global-progress>div b{color:#e5edf8;font-variant-numeric:tabular-nums}.runtime-global-progress>i{height:4px;background:rgba(255,255,255,.1);border-radius:99px;overflow:hidden}.runtime-global-progress>i>b{display:block;height:100%;background:linear-gradient(90deg,#f97316,#3b82f6);transition:width .2s}
